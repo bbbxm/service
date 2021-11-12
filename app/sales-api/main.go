@@ -1,16 +1,34 @@
 package main
 
 import (
+	"context"
+	"crypto/rsa"
 	"expvar"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/ardanlabs/conf"
+	"github.com/bbbxm/service/app/sales-api/handlers"
+	"github.com/bbbxm/service/business/auth"
+	"github.com/bbbxm/service/vendor/github.com/dgrijalva/jwt-go"
 	"github.com/pkg/errors"
 )
 
+/*
+Need to figure out timeouts for http service.
+You might want to reset your DB_HOST env var during test tear down.
+Service should start even without a DB running yet.
+symbols in profiles: https://github.com/golang/go/issues/23376 / https://github.com/google/pprof/pull/366
+*/
+
+// build is the git version of this program. It is set using build flags in the makefile.
 var build = "develop"
 
 func main() {
@@ -33,6 +51,11 @@ func run(log *log.Logger) error {
 			ReadTimeout     time.Duration `conf:"default:5s"`
 			WriteTimeout    time.Duration `conf:"default:5s"`
 			ShutdownTimeout time.Duration `conf:"default:5s"`
+		}
+		Auth struct {
+			KeyID          string `conf:"default:54bb2165-71e1-41a6-af3e-7da4a0e1e2c1"`
+			PrivateKeyFile string `conf:"default:/app/private.pem"`
+			Algorithm      string `conf:"default:RS256"`
 		}
 	}
 	cfg.Version.SVN = build
@@ -70,6 +93,99 @@ func run(log *log.Logger) error {
 		return errors.Wrap(err, "generating config for output")
 	}
 	log.Printf("main : Config :\n%v\n", out)
+
+	// =========================================================================
+	// Initialize authentication support
+
+	log.Println("main : Started : Initializing authentication support")
+
+	privatePEM, err := ioutil.ReadFile(cfg.Auth.PrivateKeyFile)
+	if err != nil {
+		return errors.Wrap(err, "reading auth private key")
+	}
+
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privatePEM)
+	if err != nil {
+		return errors.Wrap(err, "parsing auth private key")
+	}
+
+	keyLookupFunc := func(publicKID string) (*rsa.PublicKey, error) {
+		switch publicKID {
+		case cfg.Auth.KeyID:
+			return privateKey.Public().(*rsa.PublicKey), nil
+		}
+		return nil, fmt.Errorf("no public key found for the specified kid: %s", publicKID)
+	}
+	auth, err := auth.New(cfg.Auth.Algorithm, keyLookupFunc, auth.Keys{cfg.Auth.KeyID: privateKey})
+	if err != nil {
+		return errors.Wrap(err, "constructing auth")
+	}
+
+	// =========================================================================
+	// Start Debug Service
+	//
+	// /debug/pprof - Added to the default mux by importing the net/http/pprof package.
+	// /debug/vars - Added to the default mux by importing the expvar package.
+	//
+	// Not concerned with shutting this down when the application is shutdown.
+
+	log.Println("main: Initializing debugging  support")
+
+	go func() {
+		log.Printf("main: Debug Listening %s", cfg.Web.DebugHost)
+		if err := http.ListenAndServe(cfg.Web.DebugHost, http.DefaultServeMux); err != nil {
+			log.Printf("main: Debug Listener closed: %v", err)
+		}
+	}()
+
+	// =========================================================================
+	// Start API Service
+
+	log.Println("main: Initializing API support")
+
+	// Make a channel to listen for an interrupt or terminate signal from the OS.
+	// Use a buffered channel because the signal package requires it.
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	api := http.Server{
+		Addr:         cfg.Web.APIHost,
+		Handler:      handlers.API(build, shutdown, log, auth),
+		ReadTimeout:  cfg.Web.ReadTimeout,
+		WriteTimeout: cfg.Web.WriteTimeout,
+	}
+
+	// Make a channel to listen for errors coming from the listener. Use a
+	// buffered channel so the goroutine can exit if we don't collect this error.
+	serverErrors := make(chan error, 1)
+
+	// Start the service listening for requests.
+	go func() {
+		log.Printf("main: API listening on %s", api.Addr)
+		serverErrors <- api.ListenAndServe()
+	}()
+
+	// =========================================================================
+	// Shutdown
+
+	// Blocking main and waiting for shutdown.
+	select {
+	case err := <-serverErrors:
+		return errors.Wrap(err, "server error")
+
+	case sig := <-shutdown:
+		log.Printf("main: %v : Start shutdown", sig)
+
+		// Give outstanding requests a deadline for completion.
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.Web.ShutdownTimeout)
+		defer cancel()
+
+		// Asking listener to shutdown and shed load.
+		if err := api.Shutdown(ctx); err != nil {
+			api.Close()
+			return errors.Wrap(err, "could not stop server gracefully")
+		}
+	}
 
 	return nil
 }
